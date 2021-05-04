@@ -1,14 +1,13 @@
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Tuple
 
 import gym
 import numpy as np
 import torch
 from ray.rllib.models import ModelCatalog
-from ray.rllib.models.modelv2 import restore_original_dimensions
 from ray.rllib.models.torch.fcnet import FullyConnectedNetwork as TorchFC
 from ray.rllib.models.torch.misc import SlimFC, normc_initializer
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
-from ray.rllib.models.utils import get_activation_fn, get_filter_config
+from ray.rllib.models.utils import get_activation_fn
 from ray.rllib.utils.annotations import override
 from ray.rllib.utils.typing import ModelConfigDict, TensorType
 from torch import nn
@@ -45,39 +44,6 @@ def same_padding_1d(
     padding = (pad_left, pad_right)
     output = out_width
     return padding, output
-
-
-# def ortho_init_1d(scale=1.0):
-#     """
-#     Orthogonal initialization for the policy weights
-#     :param scale: (float) Scaling factor for the weights.
-#     :return: (function) an initialization function for the weights
-#     """
-
-#     # _ortho_init(shape, dtype, partition_info=None)
-#     def _ortho_init(shape, *_, **_kwargs):
-#         """Intialize weights as Orthogonal matrix.
-#         Orthogonal matrix initialization [1]_. For n-dimensional shapes where
-#         n > 2, the n-1 trailing axes are flattened. For convolutional layers, this
-#         corresponds to the fan-in, so this makes the initialization usable for
-#         both dense and convolutional layers.
-#         References
-#         ----------
-#         .. [1] Saxe, Andrew M., James L. McClelland, and Surya Ganguli.
-#                "Exact solutions to the nonlinear dynamics of learning in deep
-#                linear
-#         """
-#         # lasagne ortho init for tf
-#         shape = tuple(shape)
-#         flat_shape = (numpy.prod(shape[:-1]), shape[-1])
-
-#         gaussian_noise = numpy.random.normal(0.0, 1.0, flat_shape)
-#         u, _, v = numpy.linalg.svd(gaussian_noise, full_matrices=False)
-#         weights = u if u.shape == flat_shape else v  # pick the one with the correct shape
-#         weights = weights.reshape(shape)
-#         return (scale * weights[:shape[0], :shape[1]]).astype(numpy.float32)
-
-#     return _ortho_init
 
 
 class CustomFC(TorchModelV2, nn.Module):
@@ -163,7 +129,7 @@ class SlimConv1d(nn.Module):
         return self._model(x)
 
 
-class VisionNetwork1D(TorchModelV2, nn.Module):
+class CustomCNN(TorchModelV2, nn.Module):
     """Generic vision network."""
     def __init__(self, obs_space: gym.spaces.Space,
                  action_space: gym.spaces.Space, num_outputs: int,
@@ -269,121 +235,108 @@ class VisionNetwork1D(TorchModelV2, nn.Module):
         return res
 
 
-class CustomCNN(TorchModelV2, nn.Module):
-    def __init__(self, obs_space, action_space, num_outputs, model_config,
-                 name):
+class SemanticNetwork(TorchModelV2, nn.Module):
+    def __init__(self, obs_space: gym.spaces.Space,
+                 action_space: gym.spaces.Space, num_outputs: int,
+                 model_config: ModelConfigDict, name: str):
+        if not model_config.get("fcnet_hiddens"):
+            raise ValueError("Config for fcnet_hiddens is required")
         TorchModelV2.__init__(self, obs_space, action_space, num_outputs,
                               model_config, name)
         nn.Module.__init__(self)
 
-        self.activ = 'ReLU'
+        activation = self.model_config.get("fcnet_activation")
+        hidden_sizes = self.model_config["fcnet_hiddens"]
+        assert len(hidden_sizes) > 0,\
+            "Must provide at least 1 entry in `fcnet_hiddens`!"
 
-        self.custom_layers = []
-        self.obs_shape = obs_space
+        # Whether the last layer is the output of a Flattened (rather than
+        # a n x (1,1) Conv2D).
+        self.last_layer_is_flattened = False
+        self._logits = None
+        # Holds the current "base" output (before logits layer).
+        self._features = None
         self.num_outputs = num_outputs
+        self.hidden_sizes = hidden_sizes
+        self.activation = activation
+        self.obs_space = obs_space
 
-        self.feature_extractor = None
-        self.final_layer = None
-        self.create_layers()
+        self._create_model()
 
-    def create_layers(self):
-        activ = getattr(nn, self.activ)
-        activ_dense = getattr(nn, self.activ)
+    def _create_model(self):
+        activation = self.activation
+        layers = []
+        in_channels = sum([
+            v.shape[0] for k, v in
+            self.obs_space.original_space.child_space.spaces.items()
+        ])
+        for i, out_channels in enumerate(self.hidden_sizes):
+            layers.append(
+                SlimFC(in_channels,
+                       out_channels,
+                       initializer=normc_initializer(0.01),
+                       activation_fn=activation))
+            in_channels = out_channels
 
-        branches = {}
-        for obs_name, space in self.obs_shape.original_space.spaces.items():
-            layers = []
-            width, channel = space.shape
+        self._layers = nn.Sequential(*layers)
+        self.feat_size = out_channels
 
-            layers.append(nn.Conv1d(channel, 64, kernel_size=5, stride=3))
-            layers.append(activ())
-            # layer_1 = activ(
-            #     conv_1d(obs,
-            #             'c1_' + str(index_observation),
-            #             n_filters=64,
-            #             filter_size=5,
-            #             stride=3,
-            #             init_scale=numpy.sqrt(2)))
+        # num_outputs defined. Use that to create an exact
+        # `num_output`-sized mlp.
+        if self.num_outputs:
+            self._logits = SlimFC(out_channels,
+                                  self.num_outputs,
+                                  initializer=normc_initializer(0.01),
+                                  activation_fn=None)
+        # num_outputs not known -> Flatten, then set self.num_outputs
+        # to the resulting number of nodes.
+        else:
+            self.last_layer_is_flattened = True
+            layers.append(nn.Flatten())
+            self.num_outputs = out_channels
 
-            # layer_1 = tf.nn.dropout( layer_1, rate = 0.2)
-            # layer_1 = tf.layers.batch_normalization(layer_1)
-
-            layers.append(nn.Conv1d(64, 64, kernel_size=3, stride=2))
-            layers.append(activ())
-            # layer_2 = activ(
-            #     conv_1d(layer_1,
-            #             'c2_' + str(index_observation),
-            #             n_filters=64,
-            #             filter_size=3,
-            #             stride=2,
-            #             init_scale=numpy.sqrt(2)))
-
-            # layer_2 = tf.nn.dropout(layer_2, rate = 0.2)
-            # layer_2 = tf.layers.batch_normalization(layer_2)
-
-            # layer_3 = activ(
-            #     conv_1d(layer_2, 'c3_' + str(index_observation), n_filters=64, filter_size=3, stride=1,
-            #             init_scale=numpy.sqrt(2)))
-
-            # layer_3 = tf.nn.dropout(layer_3, rate = 0.3)
-            # layer_3 = tf.layers.batch_normalization(layer_3)
-
-            layers.append(nn.Flatten(1))
-            # layer_3 = conv_to_fc(layer_2)
-
-            layers.append(nn.Linear(576, 128))
-            layers.append(activ_dense())
-            # dense_1 = activ_dense(
-            #     linear(layer_3,
-            #            'fc1_' + str(index_observation),
-            #            n_hidden=128,
-            #            init_scale=numpy.sqrt(2)))
-            # dense_1 = tf.nn.dropout(dense_1, rate = 0.2)
-            # dense_1 = tf.layers.batch_normalization(dense_1)
-
-            # dense_2 = activ(linear(dense_1, 'fc2_'+ str(index_observation), n_hidden=128, init_scale=numpy.sqrt(2)))
-            # dense_2 = tf.nn.dropout(dense_2, rate = 0.3)
-            # dense_2 = tf.layers.batch_normalization(dense_2)
-
-            # features.append(dense_1)
-            branches[obs_name] = nn.Sequential(*layers)
-        self.feature_extractor = nn.ModuleDict(branches)
-
-        # h_concat = tf.concat(features, 1)
-
-        self._logits = nn.Sequential(
-            nn.Linear(128 * len(branches), self.num_outputs), activ_dense())
-        self._value_branch = nn.Sequential(nn.Linear(128 * len(branches), 1),
-                                           activ_dense())
-        # h_out_1 = activ_dense(
-        #     linear(h_concat, 'dense_1', n_hidden=128,
-        #            init_scale=numpy.sqrt(2)))
-        # h_out_1 = tf.nn.dropout(h_out_1, rate = 0.2)
-        # h_out_1 = tf.layers.batch_normalization(h_out_1)
-        #
-        # h_out_2 = activ(linear(h_out_1, 'dense_2', n_hidden=128, init_scale=numpy.sqrt(2)))
-        # h_out_2 = tf.nn.dropout(h_out_2, rate = 0.2)
-        # h_out_2 = tf.layers.batch_normalization(h_out_2)
+        # Build the value layers
+        self._value_branch = SlimFC(out_channels,
+                                    1,
+                                    initializer=normc_initializer(0.01),
+                                    activation_fn=None)
 
     @override(TorchModelV2)
     def forward(self, input_dict: Dict[str,
                                        TensorType], state: List[TensorType],
                 seq_lens: TensorType) -> (TensorType, List[TensorType]):
         features = []
-        for obs_name, obs in input_dict['obs'].items():
-            features.append(self.feature_extractor[obs_name](obs.permute(
-                0, 2, 1)))
-        self._features = torch.cat(features, dim=1)
+        for elements in input_dict['obs'].unbatch_all():
+            if elements:
+                elem_tensor = []
+                for elem in elements:
+                    elem_tensor.append(torch.cat([v for k, v in elem.items()]))
+                elem_tensor = torch.stack(elem_tensor)
+                print(elem_tensor)
+                features.append(
+                    torch.mean(self._layers(elem_tensor), dim=0, keepdim=True))
+            else:
+                features.append(torch.zeros((1, self.feat_size)))
+
+        self._features = torch.cat(features, dim=0)
+
         logits = self._logits(self._features)
+        assert logits.shape[0] == input_dict['obs_flat'].shape[0]
 
         return logits, state
 
     @override(TorchModelV2)
     def value_function(self) -> TensorType:
         assert self._features is not None, "must call forward() first"
-        return self._value_branch(self._features).squeeze(1)
+
+        features = self._features
+        return self._value_branch(features).squeeze(1)
+
+    def _hidden_layers(self, obs: TensorType) -> TensorType:
+        res = self._layers(obs)
+        return res
 
 
 ModelCatalog.register_custom_model("custom-fc", CustomFC)
 ModelCatalog.register_custom_model("custom-cnn", CustomCNN)
-ModelCatalog.register_custom_model("vision-1d", VisionNetwork1D)
+ModelCatalog.register_custom_model("semantic", SemanticNetwork)

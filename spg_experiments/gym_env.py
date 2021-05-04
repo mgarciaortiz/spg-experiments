@@ -1,11 +1,13 @@
 import os
 import random
+from collections import OrderedDict
 from os import path as osp
 
 import cv2
 import gym
 import numpy as np
 from gym import spaces
+from ray.rllib.utils.spaces.repeated import Repeated
 from simple_playgrounds import Engine
 from simple_playgrounds.agents import agents, sensors
 from simple_playgrounds.agents.parts import controllers
@@ -115,6 +117,10 @@ class PlaygroundEnv(gym.Env):
                 sensor_cls = sensors.BlindCamera
                 sensor_name = 'blind_0'
 
+            elif sensor_name == 'semantic':
+                sensor_cls = sensors.SemanticRay
+                sensor_name = 'semantic_0'
+
             else:
                 raise NotImplementedError(
                     f'Sensor {sensor_name} not implemented')
@@ -202,6 +208,39 @@ class PlaygroundEnv(gym.Env):
         self.game.terminate()
 
 
+class PlaygroundEnvSemantic(PlaygroundEnv):
+    def _create_agent(self, agent_type, sensors_name):
+        assert sensors_name == 'semantic'
+        super()._create_agent(agent_type, sensors_name)
+
+    def _set_obs_space(self):
+        type_shape = (len(self.playground.entity_types_map), )
+        elements_space = gym.spaces.Dict({
+            "location": gym.spaces.Box(-1, 1, shape=(3, )),
+            "type": gym.spaces.Box(0, 1, shape=type_shape),
+        })
+        max_elements = 100
+        self.observation_space = Repeated(elements_space, max_len=max_elements)
+
+    @property
+    def observations(self):
+        sensor_values = []
+
+        for detection in self.agent.sensors[0].sensor_values:
+            location = np.array([
+                detection.distance,
+                np.cos(detection.angle),
+                np.sin(detection.angle)
+            ])
+            ent_type = np.zeros((len(self.playground.entity_types_map), ),
+                                dtype=np.float32)
+            ent_type[self.playground.entity_types_map[type(
+                detection.entity)]] = 1
+            sensor_values.append(
+                OrderedDict([("location", location), ("type", ent_type)]))
+        return sensor_values
+
+
 def get_sensor_params(sensors_name):
     if sensors_name == 'rgb':
         sensors = [('rgb', {'fov': 180, 'range': 300, 'resolution': 64})]
@@ -245,6 +284,10 @@ def get_sensor_params(sensors_name):
         })]
     elif sensors_name == 'blind':
         sensors = [('blind', {'resolution': 64})]
+
+    elif sensors_name == 'semantic':
+        sensors = [('semantic', {'range': 300})]
+
     else:
         raise ValueError(f"Wrong sensors_name: {sensors_name}")
 
